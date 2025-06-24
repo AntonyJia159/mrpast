@@ -1,8 +1,9 @@
 ![](https://github.com/aprilweilab/mrpast/actions/workflows/python-package.yml/badge.svg)
 
-# mrpast
 
+# mrpast
 Infer demographic parameters from Ancestral Recombination Graphs (ARGs).
+This is a fork by Antony Jia to develop deme-to-mrpast conversion, please install from upstream.
 
 ## Install
 
