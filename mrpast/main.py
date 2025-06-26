@@ -911,7 +911,7 @@ def main():
     )
     model_parser.add_argument("model", help="The model YAML file")
     model_parser.add_argument(
-        "--to-f",
+        "--to-demes",
         "-d",
         type=str,
         help="Write a Demes YAML file representing the model.",
