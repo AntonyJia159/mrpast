@@ -256,7 +256,7 @@ def draw_graphs(
         for param_idx in model_config["coalescence"]["vectors"][epoch]:
             if param_idx > 0:
                 param = model_config["coalescence"]["parameters"][param_idx - 1]
-                pop_size = 1 / (ploidy * param["ground_truth"])
+                pop_size = 1 / (ploidy * float(param["ground_truth"]))
                 if pop_size > max_popsize:
                     max_popsize = pop_size
 
@@ -271,7 +271,7 @@ def draw_graphs(
             param_idx = coal_vector[i]
             if param_idx > 0:
                 param = model_config["coalescence"]["parameters"][param_idx - 1]
-                pop_sizes[i] = 1 / (ploidy * param["ground_truth"])
+                pop_sizes[i] = 1 / (ploidy * float(param["ground_truth"]))
         nodes = [i for i in range(num_demes) if pop_sizes[i] > 0]
         node_sizes.extend(
             [max(0, (pop_sizes[i] / max_popsize) * max_node_size) for i in nodes]
@@ -280,6 +280,8 @@ def draw_graphs(
 
         for i in nodes:
             G.add_node(base_node_id + i)
+
+        for i in nodes:
             for j in range(num_demes):
                 param_idx = mig_matrix[i][j]
                 if param_idx > 0:
@@ -287,7 +289,7 @@ def draw_graphs(
                     G.add_edge(
                         base_node_id + i,
                         base_node_id + j,
-                        weight=param["ground_truth"] * 5,
+                        weight=float(param["ground_truth"]) * 5,
                     )
 
         if grid_cols is not None:
@@ -296,10 +298,11 @@ def draw_graphs(
             pos.update(
                 {
                     base_node_id
-                    + node: (x_offset + (i % grid_cols), y_offset - (i // grid_cols))
+                    + node: (x_offset + (node % grid_cols), y_offset - (node // grid_cols))
                     for i, node in enumerate(nodes)
                 }
             )
+            print(pos)
             ax.text(x_offset, y_offset + epoch_label_spacing, f"Epoch {epoch}")
             y_offset -= (len(nodes) // grid_cols) + epoch_spacing
         else:
@@ -330,7 +333,8 @@ def draw_graphs(
             "edge_vmin": min(weights)
             * 1.25,  # These are log scale, so this makes a smaller (more negative) value
             "edge_vmax": max(weights),
-            "edge_cmap": plt.cm.Oranges,  # type: ignore
+            #"edge_cmap": plt.cm.Oranges,  # type: ignore
+            "edge_cmap": plt.cm.Spectral,
             "connectionstyle": "arc3,rad=0.1",
         }
     else:
@@ -371,36 +375,61 @@ def tab_show(filename: str, sort_by: str = "Index"):
     results = []
     total_rel = 0.0
     total_abs = 0.0
+    total_log = 0.0
+    total_srel = 0.0
     for param_idx, param in enumerate(all_params):
         gt = param["ground_truth"]
         final = param["final"]
         abserr = abs(gt - final)
         total_abs += abserr
         relerr = abserr / gt
+        logerr = abs(np.log10(final/gt))
+        total_log += logerr
         total_rel += relerr
+        total_srel += relerr**2
         epochs = set()
+
+#        def fmt(x):
+#            return str(f"{x:.2e}") if x < 1 else f"{x:.4f}"
+
+        def symbol(logerr, final, gt):
+            delta = final - gt
+            direction = "^" if delta > 0 else "v"
+            if logerr < 0.25:
+                return "-"
+            elif logerr < 0.5:
+                return direction
+            elif logerr <= 1:
+                return direction * 2
+            else:
+                return direction * 3
+
         for app in param["apply_to"]:
             epochs.add(app["epoch"])
         results.append(
             (
                 param_idx,
                 param["description"],
+                logerr,
                 relerr,
                 abserr,
                 gt,
                 final,
                 list(sorted(epochs)),
+                symbol(logerr, final, gt)
             )
         )
 
     headers = [
         "Index",
         "Description",
+        "Log Error",
         "Relative Error",
         "Absolute Error",
         "Truth",
         "Final",
         "Epochs",
+        "Symbols"
     ]
 
     try:
@@ -408,9 +437,11 @@ def tab_show(filename: str, sort_by: str = "Index"):
     except ValueError:
         raise RuntimeError(f"Unexpected sort_by key: {sort_by}. Try one of {headers}.")
     results = sorted(results, key=lambda x: x[sort_key])
-    print(tabulate(results, headers=headers))
+    print(tabulate(results, headers=headers, floatfmt=".4g"))
     print()
     print(f"Total absolute error: {total_abs}")
-    print(f"Total relative error: {total_rel}")
+    print(f"Total relative error: {total_rel}, Avg.: {total_rel/len(results)}")
+    print(f"Relative Mean Squared Error: {total_srel/len(results)}")
+    print(f"Total log error: {total_log}, Avg.: {total_log/len(results)}")
 
     return total_rel
