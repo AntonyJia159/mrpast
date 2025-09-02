@@ -356,6 +356,8 @@ def draw_graphs(
 
         for i in nodes:
             G.add_node(base_node_id + i)
+
+        for i in nodes:
             for j in range(model.num_demes):
                 entry = model.migration.get_entry(epoch, i, j)
                 if entry is not None:
