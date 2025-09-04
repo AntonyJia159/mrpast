@@ -17,8 +17,9 @@ from collections import defaultdict
 from copy import deepcopy
 from enum import Enum
 from multiprocessing import Pool
-from typing import Dict, List, Tuple, Optional, Set
 from numpy.typing import NDArray
+from tabulate import tabulate
+from typing import Dict, List, Tuple, Optional, Set
 
 import argparse
 import glob
@@ -29,6 +30,7 @@ import re
 import subprocess
 import sys
 import time
+import tskit
 import uuid
 
 try:
@@ -36,15 +38,16 @@ try:
 except ImportError:
     demes = None  # type: ignore
 
+from mrpast.polarize import polarize_vcf
 from mrpast.from_demes import convert_from_demes
 from mrpast.helpers import (
     dump_model_yaml,
     get_best_output,
     make_zarr,
-    relate_polarize,
     remove_ext,
     which,
     load_old_mrpast,
+    one_file_or_one_per_chrom,
 )
 from mrpast.simulate import (
     run_simulation,
@@ -209,13 +212,52 @@ def solve(
     return outputs
 
 
+def get_popsummary_from_args(
+    arg_prefix,
+    leave_out_pops=[],
+) -> List[Tuple[str, int]]:
+    # Load the ARG from the tree-sequence(s) and bin the coalescence times.
+    glb = f"{arg_prefix}*.trees"
+    tree_files = list(sorted(glob.glob(glb)))
+    if not tree_files:
+        print("No tree files matched glob {glb}!", file=sys.stderr)
+        exit(1)
+    leave_out_pops = set(leave_out_pops)
+    result: List[Tuple[str, int]] = []
+    for tf in tree_files:
+        ts = tskit.load(tf)
+        pop2names = [
+            p.metadata.get("name", f"pop_{i}") for i, p in enumerate(ts.populations())
+        ]
+        pop2count = [0 for _ in pop2names]
+        for tree in ts.trees():
+            for i in ts.samples():
+                pop_id = tree.population(i)
+                if pop_id not in leave_out_pops:
+                    pop2count[pop_id] += 1
+            break
+        if not result:
+            result.extend([(n, c) for n, c in zip(pop2names, pop2count)])
+        else:
+            assert len(result) == len(
+                pop2names
+            ), f"ARG {tf} has a different number of populations from the others"
+            for i in range(len(result)):
+                assert result[i] == (
+                    pop2names[i],
+                    pop2count[i],
+                ), f"ARG {tf} has a different populations/samples from the others"
+    assert result
+    return result
+
+
 def get_coaldist_from_arg(
     arg_prefix,
     jobs=1,
     leave_out_pops=[],
     min_time_unit=1.0,
     tree_sample_rate: int = DEFAULT_TREE_SAMPLE_RATE,
-    rate_maps: List[str] = [],
+    rate_maps: Optional[str] = None,
     rate_map_threshold: float = 1.0,
 ) -> List[str]:
     # Load the ARG from the tree-sequence(s) and bin the coalescence times.
@@ -227,7 +269,7 @@ def get_coaldist_from_arg(
     print(f"Found {len(tree_files)} tree files")
 
     expanded_rate_maps: List[Optional[str]] = []
-    if rate_maps:
+    if rate_maps is not None:
         # Group by "chromosome" (for simulation, this is just numbered replicated, but you can think of them
         # as being independently evolving chromosomes under the same demographic constraints). Once we have
         # the group we can match the rate_maps to the group.
@@ -241,13 +283,15 @@ def get_coaldist_from_arg(
                 group_id = m.group(1)
                 grouped[group_id].append(fn)
 
-        assert len(rate_maps) == len(grouped), (
-            "--rate-maps must have same number of files as ARGs after grouping by chromosome/replicate."
-            f" Found {len(rate_maps)} rate maps and {len(grouped)} groups of ARGs"
+        group_ids = list(sorted(grouped.keys()))
+        rate_map_list = one_file_or_one_per_chrom(
+            rate_maps, group_ids, ".txt", desc="recombination map"
         )
+        assert len(rate_map_list) == len(grouped)
+
         tree_files = []
         expanded_rate_maps = []
-        for group_key, rate_map in zip(sorted(grouped.keys()), sorted(rate_maps)):
+        for group_key, rate_map in zip(group_ids, rate_map_list):
             for tree_file in grouped[group_key]:
                 tree_files.append(tree_file)
                 expanded_rate_maps.append(rate_map)
@@ -493,6 +537,17 @@ def float_or_str(arg_value):
         return str(arg_value)
 
 
+def time_slice_list(time_slice_str: Optional[str]) -> Tuple[List[float], bool]:
+    if time_slice_str is None:
+        return ([], False)
+    is_extra = False
+    if time_slice_str.startswith("+"):
+        time_slice_str = time_slice_str[1:]
+        is_extra = True
+    time_list = list(map(float, time_slice_str.split(",")))
+    return (time_list, is_extra)
+
+
 def process_ARGs(
     model: str,
     arg_prefix: str,
@@ -512,7 +567,7 @@ def process_ARGs(
     group_by: Optional[str] = None,
     time_slice_str: Optional[str] = None,
     verbose: bool = False,
-    rate_maps: List[str] = [],
+    rate_maps: Optional[str] = None,
     rate_map_threshold: float = 1.0,
     left_skew_times: bool = False,
     seed: int = DEFAULT_RANDOM_SEED,
@@ -564,12 +619,14 @@ def process_ARGs(
 
     # Get time slices and coal matrices - this may produce many matrices if we are using
     # a sampling strategy like bootstrap or jackknife.
-    if time_slice_str is None:
+    ts_list, ts_is_extra = time_slice_list(time_slice_str)
+    if not ts_list or ts_is_extra:
         time_slices = get_time_slices(
             coal_filenames, num_times, max_generation, left_skewed=left_skew_times
         )
+        time_slices = sorted(time_slices + ts_list)
     else:
-        time_slices = list(map(float, time_slice_str.split(",")))
+        time_slices = ts_list
 
     coal_matrices, sampling_description, sampling_hashes = get_coal_counts(
         model,
@@ -643,9 +700,9 @@ def main():
     simulate_parser.add_argument(
         "--recomb-rate",
         "-e",
-        type=float_or_filename,
+        type=float_or_str,
         default=DEFAULT_RECOMB_RATE,
-        help=f"Rate of recombination, or filename for recombination map. Defaults to {DEFAULT_RECOMB_RATE}.",
+        help=f"Rate of recombination, or filename/prefix for recombination map. A prefix will match '<prefix>*.txt'. Defaults to {DEFAULT_RECOMB_RATE}.",
     )
     simulate_parser.add_argument(
         "--individuals",
@@ -757,11 +814,12 @@ def main():
     process_parser.add_argument(
         "--time-slices",
         default=None,
-        help=f"The comma-separated list of time slice values instead of computing them from coalescence counts.",
+        help=f"The comma-separated list of time slice values instead of computing them from coalescence counts. "
+        "Or, if prefixed with '+', the list of time slices to append to the auto-generated time slices.",
     )
     process_parser.add_argument(
         "--rate-maps",
-        default="",
+        default=None,
         help=f"A filename prefix for tskit-style RateMap files, whose lexicographic sort order matches the input ARGs "
         "lexicographic sort order. Generates a glob '<prefix>*.txt'. Used for determining tree sampling (see --rate-map-threshold)",
     )
@@ -992,7 +1050,6 @@ def main():
         )
         print(f"Wrote {total_trees} total marginal trees")
     elif args.command == CMD_PROCESS:
-        rate_maps = list(glob.glob(f"{args.rate_maps}"))
         num_times, left_skew = args.num_times
         if left_skew is not None:
             assert left_skew.lower() == "l"
@@ -1018,11 +1075,32 @@ def main():
             group_by=args.group_by,
             time_slice_str=args.time_slices,
             verbose=args.verbose,
-            rate_maps=rate_maps,
+            rate_maps=args.rate_maps,
             rate_map_threshold=args.rate_map_threshold,
             left_skew_times=left_skew,
             seed=args.seed,
         )
+        header = ["Model Population", "ARG Population", "Haploid Samples"]
+        arg_pops = get_popsummary_from_args(
+            args.arg_prefix, leave_out_pops=args.leave_out
+        )
+        model = UserModel.from_file(args.model)
+        fail = False
+        print()
+        if len(arg_pops) != len(model.pop_names):
+            print(
+                f"ERROR: Model has {len(model.pop_names)} populatons, but ARG only has {len(arg_pops)}",
+                file=sys.stderr,
+            )
+            fail = True
+        print("Review closely: ARG population to Model population mapping")
+        print(
+            tabulate(
+                [([m] + list(a)) for a, m in zip(arg_pops, model.pop_names)],
+                headers=header,
+            )
+        )
+        assert not fail, "Failed to process ARGs"
     elif args.command == CMD_SOLVE:
         solver_outputs = solve(args.solver_inputs, args.jobs, args.timeout)
         print(f"Created outputs: {[fn for (fn, elapsed) in solver_outputs]}")
@@ -1147,12 +1225,13 @@ def main():
             result_df.to_csv(csv_file)
             print(f"Wrote DataFrame to {csv_file}")
     elif args.command == CMD_POLARIZE:
-        relate_root = os.environ.get("RELATE_ROOT")
-        assert (
-            relate_root is not None and len(relate_root) > 0
-        ), f"RELATE_ROOT not set; required for polarizing data via RELATE"
-        relate_polarize(relate_root, args.vcf_file, args.ancestral, args.out_prefix)
-        print(f"Finished polarizing. Wrote {args.out_prefix}.vcf")
+        out_file = args.out_prefix + ".vcf"
+        if os.path.exists(out_file):
+            raise RuntimeError(f"Output file {out_file} already exists")
+        with open(args.vcf_file) as fin, open(out_file, "w") as fout:
+            stats = polarize_vcf(fin, fout, args.ancestral)
+        print(f"Finished polarizing. Wrote {out_file}")
+        stats.print(sys.stdout, prefix="  ")
     elif args.command == CMD_SHOW:
         tab_show(args.solved_result, args.sort_by)
     elif args.command == CMD_SELECT:
